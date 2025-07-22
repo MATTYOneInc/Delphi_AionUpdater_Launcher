@@ -7,17 +7,23 @@ uses
   Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.StdCtrls, Vcl.ComCtrls,
   Vcl.FileCtrl, System.IniFiles, ShellApi, System.Hash, System.JSON, System.Net.HttpClient,
   System.Threading, System.Generics.Collections, System.UITypes, System.IOUtils, System.Types,
-  System.Net.URLClient, System.Zip, System.StrUtils, System.DateUtils, PsAPI;
+  System.Net.URLClient, System.Zip, System.StrUtils, System.DateUtils, PsAPI,
+  WebView2, Winapi.ActiveX, Vcl.Edge, Vcl.OleCtrls, SHDocVw, System.Win.Registry, WinInet;
 
 type
   TForm1 = class(TForm)
-    playButton: TButton;
-    checkButton: TButton;
     Panel1: TPanel;
     Memo1: TMemo;
+    Panel2: TPanel;
+    WebBrowser1: TWebBrowser;
+    Panel3: TPanel;
     ProgressBar1: TProgressBar;
-    updateButton: TButton;
+    statusLabel: TLabel;
+    Panel4: TPanel;
+    checkButton: TButton;
     stopButton: TButton;
+    updateButton: TButton;
+    playButton: TButton;
     autoUpdateCheckBox: TCheckBox;
     updateIntervalLabel: TLabel;
     updateIntervalEdit: TEdit;
@@ -85,6 +91,32 @@ const
   SERVER_VERSION_URL = 'http://api.aion-community.ru/client/version.json';
   PATCH_LIST_URL = 'http://api.aion-community.ru/client/patches.json?current_version=';
   DEFAULT_CLIENT_VERSION = '1.0.0';
+  REQUIRED_CHECK_DAYS = 14; // Интервал автоматической проверки в днях
+
+
+//
+//function IsEdgeChromiumInstalled: Boolean;
+//var
+//  Reg: TRegistry;
+//begin
+//  Result := False;
+//  Reg := TRegistry.Create;
+//  try
+//    Reg.RootKey := HKEY_LOCAL_MACHINE;
+//    if Reg.OpenKeyReadOnly('SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}') then
+//    begin
+//      Result := Reg.ValueExists('pv'); // Проверяем наличие версии Edge
+//     Reg.CloseKey;
+//    end;
+//  finally
+//    Reg.Free;
+//  end;
+//end;
+
+procedure ClearIECacheForURL(const URL: string);
+begin
+  DeleteUrlCacheEntry(PChar(URL));
+end;
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin
@@ -100,7 +132,18 @@ begin
   UpdateUI;
   stopButton.Enabled := False;
   FClientVersion := GetCurrentClientVersion;
+
+  //if IsEdgeChromiumInstalled then
+  //  EdgeBrowser1.Navigate('https://google.com')
+  //else
+  //  ShowMessage('Edge не установлен. Браузер может отображаться не верно.');
+
+  ClearIECacheForURL('http://api.aion-community.ru/launcher/updater.html');
+  WebBrowser1.Navigate('http://api.aion-community.ru/launcher/updater.html'); // Перезагрузит страницу без кеша
+  //WebBrowser1.Navigate('http://api.aion-community.ru/launcher/updater.html');
+
 end;
+
 
 procedure TForm1.FormShow(Sender: TObject);
 begin
@@ -117,20 +160,22 @@ end;
 
 procedure TForm1.ForceCheckUpdates;
 begin
-  Memo1.Lines.Add('Р’С‹РїРѕР»РЅСЏРµС‚СЃСЏ РїСЂРѕРІРµСЂРєР° РѕР±РЅРѕРІР»РµРЅРёР№...');
+  Memo1.Lines.Add('Выполняется проверка обновлений...');
   Application.ProcessMessages;
 
   if CheckForUpdates then
   begin
-    if MessageDlg('Р”РѕСЃС‚СѓРїРЅРѕ РѕР±РЅРѕРІР»РµРЅРёРµ РґРѕ РІРµСЂСЃРёРё ' + FServerVersion +
-                 '. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ СЃРµР№С‡Р°СЃ?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
+    if MessageDlg('Доступно обновление до версии ' + FServerVersion +
+                 '. Установить сейчас?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
     begin
       updateButton.Click;
     end;
   end
   else
   begin
-    Memo1.Lines.Add('Р’Р°С€Р° РІРµСЂСЃРёСЏ РєР»РёРµРЅС‚Р° Р°РєС‚СѓР°Р»СЊРЅР°.');
+    Memo1.Lines.Add('Ваша версия клиента актуальна.');
+    playButton.Enabled := True;
+    statusLabel.Caption := 'Статус: Можно играть';
   end;
 
   with TIniFile.Create(ExtractFilePath(Application.ExeName) + SETTINGS_FILE) do
@@ -146,28 +191,51 @@ var
   IniFile: TIniFile;
   LastCheck: TDateTime;
   CheckIntervalHours: Integer;
+  HoursSinceLastCheck: Integer;
 begin
   try
     IniFile := TIniFile.Create(ExtractFilePath(Application.ExeName) + SETTINGS_FILE);
     try
-      if not IniFile.ReadBool('Settings', 'AutoCheckUpdates', True) then
-      begin
-        Memo1.Lines.Add('РђРІС‚РѕРїСЂРѕРІРµСЂРєР° РѕР±РЅРѕРІР»РµРЅРёР№ РѕС‚РєР»СЋС‡РµРЅР° РІ РЅР°СЃС‚СЂРѕР№РєР°С…');
-        Exit;
-      end;
-
-      CheckIntervalHours := IniFile.ReadInteger('Settings', 'UpdateCheckInterval', 24);
       LastCheck := IniFile.ReadDateTime('Settings', 'LastUpdateCheck', 0);
+      HoursSinceLastCheck := HoursBetween(Now, LastCheck);
 
-      if (LastCheck = 0) or (HoursBetween(Now, LastCheck) >= CheckIntervalHours) then
+      // Обязательная проверка, если прошло более 14 дней
+      if (HoursSinceLastCheck >= REQUIRED_CHECK_DAYS) then
       begin
-        Memo1.Lines.Add('РџСЂРѕРІРµСЂРєР° РѕР±РЅРѕРІР»РµРЅРёР№...');
+        Memo1.Lines.Add('Обязательная проверка клиента (раз в 14 дней)...');
         Application.ProcessMessages;
 
         if CheckForUpdates then
         begin
-          if MessageDlg('Р”РѕСЃС‚СѓРїРЅРѕ РѕР±РЅРѕРІР»РµРЅРёРµ РґРѕ РІРµСЂСЃРёРё ' + FServerVersion +
-                       '. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ СЃРµР№С‡Р°СЃ?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
+          if MessageDlg('Доступно обновление до версии ' + FServerVersion +
+                       '. Установить сейчас?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
+          begin
+            updateButton.Click;
+          end;
+        end;
+
+        IniFile.WriteDateTime('Settings', 'LastUpdateCheck', Now);
+        Exit;
+      end;
+
+      // Обычная проверка по настройкам пользователя
+      if not IniFile.ReadBool('Settings', 'AutoCheckUpdates', True) then
+      begin
+        Memo1.Lines.Add('Автопроверка обновлений отключена в настройках');
+        Exit;
+      end;
+
+      CheckIntervalHours := IniFile.ReadInteger('Settings', 'UpdateCheckInterval', 24);
+
+      if (LastCheck = 0) or (HoursSinceLastCheck >= CheckIntervalHours) then
+      begin
+        Memo1.Lines.Add('Проверка обновлений...');
+        Application.ProcessMessages;
+
+        if CheckForUpdates then
+        begin
+          if MessageDlg('Доступно обновление до версии ' + FServerVersion +
+                       '. Установить сейчас?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
           begin
             updateButton.Click;
           end;
@@ -177,15 +245,15 @@ begin
       end
       else
       begin
-        Memo1.Lines.Add('РЎР»РµРґСѓСЋС‰Р°СЏ РїСЂРѕРІРµСЂРєР° С‡РµСЂРµР· ' +
-          IntToStr(CheckIntervalHours - HoursBetween(Now, LastCheck)) + ' С‡.');
+        Memo1.Lines.Add('Следующая проверка через ' +
+          IntToStr(CheckIntervalHours - HoursSinceLastCheck) + ' ч.');
       end;
     finally
       IniFile.Free;
     end;
   except
     on E: Exception do
-      Memo1.Lines.Add('РћС€РёР±РєР° РїСЂРѕРІРµСЂРєРё РѕР±РЅРѕРІР»РµРЅРёР№: ' + E.Message);
+      Memo1.Lines.Add('Ошибка проверки обновлений: ' + E.Message);
   end;
 end;
 
@@ -205,7 +273,7 @@ var
 begin
   Value := StrToIntDef(updateIntervalEdit.Text, 24);
   if Value < 1 then Value := 1;
-  if Value > 168 then Value := 168; // РќРµ Р±РѕР»РµРµ 1 РЅРµРґРµР»Рё
+  if Value > 168 then Value := 168; // Не более 1 недели
 
   with TIniFile.Create(ExtractFilePath(Application.ExeName) + SETTINGS_FILE) do
   try
@@ -239,7 +307,7 @@ begin
     end;
   except
     on E: Exception do
-      Memo1.Lines.Add('РћС€РёР±РєР° С‡С‚РµРЅРёСЏ РІРµСЂСЃРёРё РєР»РёРµРЅС‚Р°: ' + E.Message);
+      Memo1.Lines.Add('Ошибка чтения версии клиента: ' + E.Message);
   end;
 end;
 
@@ -270,11 +338,11 @@ begin
       end
       else
       begin
-        Memo1.Lines.Add('РћС€РёР±РєР° РїРѕР»СѓС‡РµРЅРёСЏ РІРµСЂСЃРёРё СЃРµСЂРІРµСЂР°: HTTP ' + IntToStr(Response.StatusCode));
+        Memo1.Lines.Add('Ошибка получения версии сервера: HTTP ' + IntToStr(Response.StatusCode));
       end;
     except
       on E: Exception do
-        Memo1.Lines.Add('РћС€РёР±РєР° РїРѕР»СѓС‡РµРЅРёСЏ РІРµСЂСЃРёРё СЃРµСЂРІРµСЂР°: ' + E.Message);
+        Memo1.Lines.Add('Ошибка получения версии сервера: ' + E.Message);
     end;
   finally
     HTTPClient.Free;
@@ -301,21 +369,23 @@ begin
 
     if FServerVersion = '' then
     begin
-      Memo1.Lines.Add('РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ РІРµСЂСЃРёСЋ СЃРµСЂРІРµСЂР°');
+      Memo1.Lines.Add('Не удалось получить версию сервера');
       Exit;
     end;
 
-    Memo1.Lines.Add('РўРµРєСѓС‰Р°СЏ РІРµСЂСЃРёСЏ: ' + FClientVersion);
-    Memo1.Lines.Add('РђРєС‚СѓР°Р»СЊРЅР°СЏ РІРµСЂСЃРёСЏ: ' + FServerVersion);
+    Memo1.Lines.Add('Текущая версия: ' + FClientVersion);
+    Memo1.Lines.Add('Актуальная версия: ' + FServerVersion);
 
     Result := CompareText(FClientVersion, FServerVersion) <> 0;
     if Result then
-      Memo1.Lines.Add('Р”РѕСЃС‚СѓРїРЅРѕ РѕР±РЅРѕРІР»РµРЅРёРµ!')
+      statusLabel.Caption := 'Статус: Требуется обновление'
     else
-      Memo1.Lines.Add('РЈ РІР°СЃ Р°РєС‚СѓР°Р»СЊРЅР°СЏ РІРµСЂСЃРёСЏ');
+      Memo1.Lines.Add('У вас актуальная версия');
+      playButton.Enabled := True;
+      statusLabel.Caption := 'Статус: Можно играть';
   except
     on E: Exception do
-      Memo1.Lines.Add('РћС€РёР±РєР° РїСЂРѕРІРµСЂРєРё РѕР±РЅРѕРІР»РµРЅРёР№: ' + E.Message);
+      Memo1.Lines.Add('Ошибка проверки обновлений: ' + E.Message);
   end;
 end;
 
@@ -350,7 +420,7 @@ begin
               FPatchList.Add((JSONArray.Items[i] as TJSONObject).GetValue('url').Value);
             end;
             Result := True;
-            Memo1.Lines.Add('РџРѕР»СѓС‡РµРЅРѕ РїР°С‚С‡РµР№: ' + IntToStr(FPatchList.Count));
+            Memo1.Lines.Add('Получено патчей: ' + IntToStr(FPatchList.Count));
           end;
         finally
           JSONValue.Free;
@@ -358,11 +428,11 @@ begin
       end
       else
       begin
-        Memo1.Lines.Add('РћС€РёР±РєР° РїРѕР»СѓС‡РµРЅРёСЏ СЃРїРёСЃРєР° РїР°С‚С‡РµР№: HTTP ' + IntToStr(Response.StatusCode));
+        Memo1.Lines.Add('Ошибка получения списка патчей: HTTP ' + IntToStr(Response.StatusCode));
       end;
     except
       on E: Exception do
-        Memo1.Lines.Add('РћС€РёР±РєР° РїРѕР»СѓС‡РµРЅРёСЏ СЃРїРёСЃРєР° РїР°С‚С‡РµР№: ' + E.Message);
+        Memo1.Lines.Add('Ошибка получения списка патчей: ' + E.Message);
     end;
   finally
     HTTPClient.Free;
@@ -386,25 +456,25 @@ begin
     if not FScanning then
     begin
       Result := False;
-      Memo1.Lines.Add('РћР±РЅРѕРІР»РµРЅРёРµ РїСЂРµСЂРІР°РЅРѕ');
+      Memo1.Lines.Add('Обновление прервано');
       Break;
     end;
 
     PatchURL := FPatchList[i];
     PatchFile := IncludeTrailingPathDelimiter(ExtractFilePath(Application.ExeName)) + 'patch_' + IntToStr(i) + '.zip';
 
-    Memo1.Lines.Add(Format('[%d/%d] Р—Р°РіСЂСѓР·РєР°: %s', [i+1, FPatchList.Count, PatchURL]));
+    Memo1.Lines.Add(Format('[%d/%d] Загрузка: %s', [i+1, FPatchList.Count, PatchURL]));
 
     if not DownloadFile(PatchURL, PatchFile) then
     begin
-      Memo1.Lines.Add('РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё');
+      Memo1.Lines.Add('Ошибка загрузки');
       Result := False;
       Break;
     end;
     ProgressBar1.Position := ProgressBar1.Position + 1;
     Application.ProcessMessages;
 
-    Memo1.Lines.Add('РџСЂРёРјРµРЅРµРЅРёРµ РїР°С‚С‡Р°...');
+    Memo1.Lines.Add('Применение патча...');
     ApplyPatch(PatchFile);
     ProgressBar1.Position := ProgressBar1.Position + 1;
     Application.ProcessMessages;
@@ -419,7 +489,7 @@ begin
       finally
         Free;
       end;
-      Memo1.Lines.Add('Р’РµСЂСЃРёСЏ РѕР±РЅРѕРІР»РµРЅР°: ' + FClientVersion);
+      Memo1.Lines.Add('Версия обновлена: ' + FClientVersion);
     end;
   end;
 end;
@@ -433,7 +503,7 @@ var
 begin
   if not FileExists(PatchFile) then
   begin
-    Memo1.Lines.Add('Р¤Р°Р№Р» РїР°С‚С‡Р° РЅРµ РЅР°Р№РґРµРЅ: ' + PatchFile);
+    Memo1.Lines.Add('Файл патча не найден: ' + PatchFile);
     Exit;
   end;
 
@@ -449,10 +519,10 @@ begin
         FileName := ZipFile.FileNames[i];
         OutputPath := IncludeTrailingPathDelimiter(FGamePath) + FileName;
 
-        Memo1.Lines.Add('РћР±РЅРѕРІР»РµРЅРёРµ: ' + FileName);
+        Memo1.Lines.Add('Обновление: ' + FileName);
         if not CreateDirectoryForFile(OutputPath) then
         begin
-          Memo1.Lines.Add('РћС€РёР±РєР° СЃРѕР·РґР°РЅРёСЏ РґРёСЂРµРєС‚РѕСЂРёРё РґР»СЏ: ' + FileName);
+          Memo1.Lines.Add('Ошибка создания директории для: ' + FileName);
           Continue;
         end;
 
@@ -463,15 +533,15 @@ begin
           ZipFile.Extract(i, OutputPath, False);
         except
           on E: Exception do
-            Memo1.Lines.Add('РћС€РёР±РєР° СЂР°СЃРїР°РєРѕРІРєРё С„Р°Р№Р»Р° ' + FileName + ': ' + E.Message);
+            Memo1.Lines.Add('Ошибка распаковки файла ' + FileName + ': ' + E.Message);
         end;
         Application.ProcessMessages;
       end;
 
-      Memo1.Lines.Add('РџР°С‚С‡ РїСЂРёРјРµРЅРµРЅ');
+      Memo1.Lines.Add('Патч применен');
     except
       on E: Exception do
-        Memo1.Lines.Add('РћС€РёР±РєР° СЂР°СЃРїР°РєРѕРІРєРё: ' + E.Message);
+        Memo1.Lines.Add('Ошибка распаковки: ' + E.Message);
     end;
   finally
     ZipFile.Free;
@@ -486,11 +556,11 @@ begin
 
   FUpdateInProgress := True;
   try
-    Memo1.Lines.Add('--- РџСЂРѕРІРµСЂРєР° РѕР±РЅРѕРІР»РµРЅРёР№ ---');
+    Memo1.Lines.Add('--- Проверка обновлений ---');
 
     if not CheckForUpdates then
     begin
-      Memo1.Lines.Add('РћР±РЅРѕРІР»РµРЅРёСЏ РЅРµ С‚СЂРµР±СѓСЋС‚СЃСЏ');
+      Memo1.Lines.Add('Обновления не требуются');
       Exit;
     end;
 
@@ -500,23 +570,23 @@ begin
 
     if not GetPatchList then
     begin
-      Memo1.Lines.Add('РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ СЃРїРёСЃРѕРє РїР°С‚С‡РµР№');
+      Memo1.Lines.Add('Не удалось получить список патчей');
       Exit;
     end;
 
     if FPatchList.Count = 0 then
     begin
-      Memo1.Lines.Add('РќРµС‚ РґРѕСЃС‚СѓРїРЅС‹С… РїР°С‚С‡РµР№');
+      Memo1.Lines.Add('Нет доступных патчей');
       Exit;
     end;
 
     if DownloadAndApplyPatches then
     begin
-      Memo1.Lines.Add('Р’СЃРµ РїР°С‚С‡Рё СѓСЃРїРµС€РЅРѕ РїСЂРёРјРµРЅРµРЅС‹!');
-      Memo1.Lines.Add('РќРѕРІР°СЏ РІРµСЂСЃРёСЏ: ' + FClientVersion);
+      Memo1.Lines.Add('Все патчи успешно применены!');
+      Memo1.Lines.Add('Новая версия: ' + FClientVersion);
     end;
 
-    Memo1.Lines.Add('--- РћР±РЅРѕРІР»РµРЅРёРµ Р·Р°РІРµСЂС€РµРЅРѕ ---');
+    Memo1.Lines.Add('--- Обновление завершено ---');
   finally
     FUpdateInProgress := False;
     updateButton.Enabled := True;
@@ -536,17 +606,17 @@ begin
   begin
     FGamePath := CurrentDir;
     SaveSettings;
-    Memo1.Lines.Add('РРіСЂР° РЅР°Р№РґРµРЅР°: ' + FGamePath);
+    Memo1.Lines.Add('Игра найдена: ' + FGamePath);
     Exit;
   end;
 
   if (FGamePath <> '') and ValidateGamePath(FGamePath) then
   begin
-    Memo1.Lines.Add('РСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ СЃРѕС…СЂР°РЅРµРЅРЅС‹Р№ РїСѓС‚СЊ: ' + FGamePath);
+    Memo1.Lines.Add('Используется сохраненный путь: ' + FGamePath);
     Exit;
   end;
 
-  Memo1.Lines.Add('РРіСЂР° РЅРµ РЅР°Р№РґРµРЅР°. РЈРєР°Р¶РёС‚Рµ РїР°РїРєСѓ СЃ РёРіСЂРѕР№.');
+  Memo1.Lines.Add('Игра не найдена. Укажите папку с игрой.');
   SelectGameFolder;
 end;
 
@@ -566,7 +636,7 @@ var
   DirSelected: Boolean;
   SelectedPath: string;
 begin
-  DirSelected := SelectDirectory('Р’С‹Р±РµСЂРёС‚Рµ РїР°РїРєСѓ СЃ РёРіСЂРѕР№', '', SelectedPath,
+  DirSelected := SelectDirectory('Выберите папку с игрой', '', SelectedPath,
     [sdNewUI, sdNewFolder, sdShowEdit, sdValidateDir], Self);
 
   if DirSelected then
@@ -576,18 +646,18 @@ begin
     begin
       FGamePath := SelectedPath;
       SaveSettings;
-      Memo1.Lines.Add('РџР°РїРєР° РІС‹Р±СЂР°РЅР°: ' + FGamePath);
+      Memo1.Lines.Add('Папка выбрана: ' + FGamePath);
       UpdateUI;
     end
     else
     begin
-      MessageDlg('РќРµ РЅР°Р№РґРµРЅС‹ С„Р°Р№Р»С‹ РёРіСЂС‹. Р’С‹Р±РµСЂРёС‚Рµ РґСЂСѓРіСѓСЋ РїР°РїРєСѓ.', mtError, [mbOK], 0);
+      MessageDlg('Не найдены файлы игры. Выберите другую папку.', mtError, [mbOK], 0);
       SelectGameFolder;
     end;
   end
   else if FGamePath = '' then
   begin
-    if MessageDlg('Р‘РµР· СѓРєР°Р·Р°РЅРёСЏ РїР°РїРєРё Р»Р°СѓРЅС‡РµСЂ РЅРµ РјРѕР¶РµС‚ СЂР°Р±РѕС‚Р°С‚СЊ. Р—Р°РєСЂС‹С‚СЊ РїСЂРѕРіСЂР°РјРјСѓ?',
+    if MessageDlg('Без указания папки лаунчер не может работать. Закрыть программу?',
        mtConfirmation, [mbYes, mbNo], 0) = mrYes then
       Application.Terminate
     else
@@ -644,7 +714,7 @@ begin
     end;
   except
     on E: Exception do
-      Memo1.Lines.Add('РћС€РёР±РєР° РІС‹С‡РёСЃР»РµРЅРёСЏ С…СЌС€Р° С„Р°Р№Р»Р° ' + FilePath + ': ' + E.Message);
+      Memo1.Lines.Add('Ошибка вычисления хэша файла ' + FilePath + ': ' + E.Message);
   end;
 end;
 
@@ -657,7 +727,7 @@ var
   JSONItem: TJSONValue;
   i: Integer;
 begin
-  Memo1.Lines.Add('Р—Р°РіСЂСѓР·РєР° С…СЌС€РµР№ СЃ СЃРµСЂРІРµСЂР°...');
+  Memo1.Lines.Add('Загрузка хэшей с сервера...');
   Application.ProcessMessages;
 
   HTTPClient := THTTPClient.Create;
@@ -691,7 +761,7 @@ begin
                   );
                 end;
               end;
-              Memo1.Lines.Add('Р—Р°РіСЂСѓР¶РµРЅРѕ С…СЌС€РµР№: ' + IntToStr(FFileHashes.Count));
+              Memo1.Lines.Add('Загружено хэшей: ' + IntToStr(FFileHashes.Count));
             end;
           end;
         finally
@@ -699,11 +769,11 @@ begin
         end;
       end
       else
-        raise Exception.Create('РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё: ' + IntToStr(Response.StatusCode));
+        raise Exception.Create('Ошибка загрузки: ' + IntToStr(Response.StatusCode));
     except
       on E: Exception do
       begin
-        Memo1.Lines.Add('РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё С…СЌС€РµР№: ' + E.Message);
+        Memo1.Lines.Add('Ошибка загрузки хэшей: ' + E.Message);
         raise;
       end;
     end;
@@ -734,14 +804,14 @@ begin
   Result := False;
   if not CreateDirectoryForFile(LocalPath) then
   begin
-    Memo1.Lines.Add('РћС€РёР±РєР° СЃРѕР·РґР°РЅРёСЏ РґРёСЂРµРєС‚РѕСЂРёРё: ' + LocalPath);
+    Memo1.Lines.Add('Ошибка создания директории: ' + LocalPath);
     Exit;
   end;
 
   FixedRemotePath := StringReplace(RemotePath, '\', '/', [rfReplaceAll]);
   RemoteURL := FixedRemotePath;
 
-  Memo1.Lines.Add('РЎРєР°С‡РёРІР°РЅРёРµ: ' + RemoteURL + ' -> ' + LocalPath);
+  Memo1.Lines.Add('Скачивание: ' + RemoteURL + ' -> ' + LocalPath);
 
   HTTPClient := THTTPClient.Create;
   try
@@ -756,11 +826,11 @@ begin
         if Response.StatusCode = 200 then
         begin
           Result := True;
-          Memo1.Lines.Add('РЈСЃРїРµС€РЅРѕ СЃРєР°С‡Р°РЅ: ' + LocalPath);
+          Memo1.Lines.Add('Успешно скачан: ' + LocalPath);
         end
         else
         begin
-          Memo1.Lines.Add('РћС€РёР±РєР° СЃРєР°С‡РёРІР°РЅРёСЏ (' + IntToStr(Response.StatusCode) + '): ' + LocalPath);
+          Memo1.Lines.Add('Ошибка скачивания (' + IntToStr(Response.StatusCode) + '): ' + LocalPath);
           if FileExists(LocalPath) then
             DeleteFile(LocalPath);
         end;
@@ -770,7 +840,7 @@ begin
     except
       on E: Exception do
       begin
-        Memo1.Lines.Add('РћС€РёР±РєР° СЃРєР°С‡РёРІР°РЅРёСЏ: ' + E.Message);
+        Memo1.Lines.Add('Ошибка скачивания: ' + E.Message);
         if FileExists(LocalPath) then
           DeleteFile(LocalPath);
       end;
@@ -789,11 +859,11 @@ var
 begin
   if FFileHashes.Count = 0 then
   begin
-    Memo1.Lines.Add('РќРµС‚ РґР°РЅРЅС‹С… Рѕ С…СЌС€Р°С… С„Р°Р№Р»РѕРІ');
+    Memo1.Lines.Add('Нет данных о хэшах файлов');
     Exit;
   end;
 
-  Memo1.Lines.Add('РќР°С‡Р°Р»Рѕ РїСЂРѕРІРµСЂРєРё С„Р°Р№Р»РѕРІ...');
+  Memo1.Lines.Add('Начало проверки файлов...');
   ProgressBar1.Position := 0;
   ProgressBar1.Max := FFileHashes.Count;
   MismatchCount := 0;
@@ -808,7 +878,9 @@ begin
     begin
       if not FScanning then
       begin
-        Memo1.Lines.Add('РџСЂРѕРІРµСЂРєР° РїСЂРµСЂРІР°РЅР°');
+        statusLabel.Caption := 'Статус: Требуется проверка клиента';
+        Memo1.Lines.Add('Проверка прервана');
+        playButton.Enabled := False;
         Break;
       end;
 
@@ -821,14 +893,14 @@ begin
         if not SameText(LocalHash, ServerHash) then
         begin
           Inc(MismatchCount);
-          Memo1.Lines.Add(Format('РќРµСЃРѕРѕС‚РІРµС‚СЃС‚РІРёРµ: %s (РѕР¶РёРґР°Р»РѕСЃСЊ: %s, РЅР°Р№РґРµРЅРѕ: %s)',
+          Memo1.Lines.Add(Format('Несоответствие: %s (ожидалось: %s, найдено: %s)',
             [RelativePath, ServerHash, LocalHash]));
 
           LocalFilePath := IncludeTrailingPathDelimiter(FGamePath) + RelativePath;
           if DownloadFile(FServerBaseURL + RelativePath, LocalFilePath) then
           begin
             Inc(FixedCount);
-            Memo1.Lines.Add('Р¤Р°Р№Р» Р·Р°РјРµРЅРµРЅ: ' + RelativePath);
+            Memo1.Lines.Add('Файл заменен: ' + RelativePath);
           end;
         end;
       end;
@@ -839,8 +911,8 @@ begin
 
     if FScanning then
     begin
-      Memo1.Lines.Add(Format('РџСЂРѕРІРµСЂРєР° Р·Р°РІРµСЂС€РµРЅР°. РќРµСЃРѕРѕС‚РІРµС‚СЃС‚РІРёР№: %d РёР· %d', [MismatchCount, FFileHashes.Count]));
-      Memo1.Lines.Add(Format('РСЃРїСЂР°РІР»РµРЅРѕ С„Р°Р№Р»РѕРІ: %d', [FixedCount]));
+      Memo1.Lines.Add(Format('Проверка завершена. Несоответствий: %d из %d', [MismatchCount, FFileHashes.Count]));
+      Memo1.Lines.Add(Format('Исправлено файлов: %d', [FixedCount]));
     end;
   finally
     FScanning := False;
@@ -853,10 +925,14 @@ procedure TForm1.checkButtonClick(Sender: TObject);
 begin
   checkButton.Enabled := False;
   try
-    Memo1.Lines.Add('--- РќР°С‡Р°Р»Рѕ РїСЂРѕРІРµСЂРєРё ---');
+    statusLabel.Caption := 'Статус: Проверка клиента...';
+    Memo1.Lines.Add('--- Начало проверки ---');
+    playButton.Enabled := False;
     LoadServerHashes;
     CompareFiles;
-    Memo1.Lines.Add('--- РџСЂРѕРІРµСЂРєР° Р·Р°РІРµСЂС€РµРЅР° ---');
+    Memo1.Lines.Add('--- Проверка завершена ---');
+    statusLabel.Caption := 'Статус: Можно играть...';
+    playButton.Enabled := True;
   finally
     checkButton.Enabled := True;
   end;
@@ -885,12 +961,12 @@ begin
   if GetModuleFileNameEx(hProcess, 0, ModName, MAX_PATH) <> 0 then
     Result := ModName
   else
-    Result := 'РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ РёРјСЏ';
+    Result := 'Не удалось получить имя';
 end;
 
 //function TForm1.CheckDependencies: Boolean;
 //var
-//  Dependencies: array[0..2] of string; // РЎС‚Р°С‚РёС‡РµСЃРєРёР№ РјР°СЃСЃРёРІ С„РёРєСЃРёСЂРѕРІР°РЅРЅРѕРіРѕ СЂР°Р·РјРµСЂР°
+//  Dependencies: array[0..2] of string; // Статический массив фиксированного размера
 //  I: Integer;
 //begin
 //  Result := True;
@@ -902,7 +978,7 @@ end;
 //  begin
 //    if GetModuleHandle(PChar(Dependencies[I])) = 0 then
 //    begin
-//      Memo1.Lines.Add('РќРµ РЅР°Р№РґРµРЅР° Р·Р°РІРёСЃРёРјРѕСЃС‚СЊ: ' + Dependencies[I]);
+//      Memo1.Lines.Add('Не найдена зависимость: ' + Dependencies[I]);
 //      Result := False;
 //    end;
 //  end;
@@ -936,26 +1012,26 @@ begin
     GameExe := IncludeTrailingPathDelimiter(FGamePath) + 'bin32\aion.bin';
     if not FileExists(GameExe) then
     begin
-      MessageDlg('Р¤Р°Р№Р» РёРіСЂС‹ РЅРµ РЅР°Р№РґРµРЅ!', mtError, [mbOK], 0);
+      MessageDlg('Файл игры не найден!', mtError, [mbOK], 0);
       Exit;
     end;
   end;
 
-  // РџСЂРѕРІРµСЂРєР° Р·Р°РІРёСЃРёРјРѕСЃС‚РµР№
+  // Проверка зависимостей
   //if not CheckDependencies then
   //begin
-  //  if MessageDlg('РќРµ РЅР°Р№РґРµРЅС‹ РЅРµРѕР±С…РѕРґРёРјС‹Рµ DLL-Р±РёР±Р»РёРѕС‚РµРєРё. Р—Р°РїСѓСЃС‚РёС‚СЊ РёРіСЂСѓ РІСЃРµ СЂР°РІРЅРѕ?',
+  //  if MessageDlg('Не найдены необходимые DLL-библиотеки. Запустить игру все равно?',
   //     mtWarning, [mbYes, mbNo], 0) = mrNo then
   //    Exit;
   //end;
 
-  // РџРѕРїСЂРѕР±СѓРµРј СЃРЅР°С‡Р°Р»Р° РѕР±С‹С‡РЅС‹Р№ Р·Р°РїСѓСЃРє
+  // Попробуем сначала обычный запуск
   if not TryNormalLaunch(GameExe) then
   begin
-    // Р•СЃР»Рё РЅРµ РїРѕР»СѓС‡РёР»РѕСЃСЊ, РїСЂРѕР±СѓРµРј СЃ РїСЂР°РІР°РјРё Р°РґРјРёРЅР°
-    Memo1.Lines.Add('РџСЂРѕР±СѓРµРј Р·Р°РїСѓСЃРє СЃ РїСЂР°РІР°РјРё Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР°...');
+    // Если не получилось, пробуем с правами админа
+    Memo1.Lines.Add('Пробуем запуск с правами администратора...');
     if not RunAsAdmin(GameExe, '-ip:127.0.0.1 -port:2106 -cc:1 -lang:enu -noweb -nowebshop -nokicks -noauthgg -charnamemenu -ingameshop -win10-mouse-fix-autodetect -disable-xigncode') then
-      MessageDlg('РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РёРіСЂСѓ', mtError, [mbOK], 0);
+      MessageDlg('Не удалось запустить игру', mtError, [mbOK], 0);
   end;
 end;
 
@@ -987,12 +1063,12 @@ begin
     WaitForSingleObject(ProcessInfo.hProcess, 5000);
     GetExitCodeProcess(ProcessInfo.hProcess, ExitCode);
 
-    // РљРѕРґС‹ РѕС€РёР±РѕРє Windows
+    // Коды ошибок Windows
     case ExitCode of
-      STILL_ACTIVE: Memo1.Lines.Add('РРіСЂР° Р·Р°РїСѓС‰РµРЅР° СѓСЃРїРµС€РЅРѕ');
-      3221225477: Memo1.Lines.Add('РћС€РёР±РєР°: ACCESS_VIOLATION - РїСЂРѕРІРµСЂСЊС‚Рµ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё');
-      3221225786: Memo1.Lines.Add('РћС€РёР±РєР°: DLL_NOT_FOUND');
-      else Memo1.Lines.Add('РљРѕРґ РІС‹С…РѕРґР°: ' + IntToStr(ExitCode));
+      STILL_ACTIVE: Memo1.Lines.Add('Игра запущена успешно');
+      3221225477: Memo1.Lines.Add('Ошибка: ACCESS_VIOLATION - проверьте зависимости');
+      3221225786: Memo1.Lines.Add('Ошибка: DLL_NOT_FOUND');
+      else Memo1.Lines.Add('Код выхода: ' + IntToStr(ExitCode));
     end;
 
     CloseHandle(ProcessInfo.hThread);
@@ -1005,8 +1081,9 @@ begin
   if FScanning then
   begin
     FScanning := False;
-    Memo1.Lines.Add('РћСЃС‚Р°РЅРѕРІРєР° РїСЂРѕРІРµСЂРєРё...');
+    Memo1.Lines.Add('Остановка проверки...');
     stopButton.Enabled := False;
+    playButton.Enabled := True;
   end;
 end;
 
