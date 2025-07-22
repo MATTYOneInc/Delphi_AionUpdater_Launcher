@@ -7,7 +7,7 @@ uses
   Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.StdCtrls, Vcl.ComCtrls,
   Vcl.FileCtrl, System.IniFiles, ShellApi, System.Hash, System.JSON, System.Net.HttpClient,
   System.Threading, System.Generics.Collections, System.UITypes, System.IOUtils, System.Types,
-  System.Net.URLClient, System.Zip, System.StrUtils, System.DateUtils;
+  System.Net.URLClient, System.Zip, System.StrUtils, System.DateUtils, PsAPI;
 
 type
   TForm1 = class(TForm)
@@ -59,6 +59,11 @@ type
     function ExtractVersionFromUrl(const Url: string): string;
     procedure CheckUpdatesOnStartup;
     procedure ForceCheckUpdates;
+    function IsProcessRunning(PID: DWORD): Boolean;
+    function GetProcessName(hProcess: THandle): string;
+    //function CheckDependencies: Boolean;
+    function RunAsAdmin(const ExePath, Params: string): Boolean;
+    function TryNormalLaunch(const ExePath: string): Boolean;
   public
     destructor Destroy; override;
   end;
@@ -79,6 +84,7 @@ const
   VERSION_FILE = 'version.ini';
   SERVER_VERSION_URL = 'http://api.aion-community.ru/client/version.json';
   PATCH_LIST_URL = 'http://api.aion-community.ru/client/patches.json?current_version=';
+  DEFAULT_CLIENT_VERSION = '1.0.0';
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin
@@ -194,10 +200,17 @@ begin
 end;
 
 procedure TForm1.UpdateIntervalEditChange(Sender: TObject);
+var
+  Value: Integer;
 begin
+  Value := StrToIntDef(updateIntervalEdit.Text, 24);
+  if Value < 1 then Value := 1;
+  if Value > 168 then Value := 168; // Не более 1 недели
+
   with TIniFile.Create(ExtractFilePath(Application.ExeName) + SETTINGS_FILE) do
   try
-    WriteInteger('Settings', 'UpdateCheckInterval', StrToIntDef(updateIntervalEdit.Text, 24));
+    WriteInteger('Settings', 'UpdateCheckInterval', Value);
+    updateIntervalEdit.Text := IntToStr(Value);
   finally
     Free;
   end;
@@ -214,14 +227,19 @@ function TForm1.GetCurrentClientVersion: string;
 var
   IniFile: TIniFile;
 begin
-  Result := '1.0.0';
+  Result := DEFAULT_CLIENT_VERSION;
   if FGamePath = '' then Exit;
 
-  IniFile := TIniFile.Create(IncludeTrailingPathDelimiter(FGamePath) + VERSION_FILE);
   try
-    Result := IniFile.ReadString('Version', 'Client', '1.0.0');
-  finally
-    IniFile.Free;
+    IniFile := TIniFile.Create(IncludeTrailingPathDelimiter(FGamePath) + VERSION_FILE);
+    try
+      Result := IniFile.ReadString('Version', 'Client', DEFAULT_CLIENT_VERSION);
+    finally
+      IniFile.Free;
+    end;
+  except
+    on E: Exception do
+      Memo1.Lines.Add('Ошибка чтения версии клиента: ' + E.Message);
   end;
 end;
 
@@ -235,7 +253,10 @@ begin
   HTTPClient := THTTPClient.Create;
   try
     try
+      HTTPClient.ConnectionTimeout := 5000;
+      HTTPClient.ResponseTimeout := 10000;
       Response := HTTPClient.Get(SERVER_VERSION_URL);
+
       if Response.StatusCode = 200 then
       begin
         JSONValue := TJSONObject.ParseJSONValue(Response.ContentAsString);
@@ -246,6 +267,10 @@ begin
         finally
           JSONValue.Free;
         end;
+      end
+      else
+      begin
+        Memo1.Lines.Add('Ошибка получения версии сервера: HTTP ' + IntToStr(Response.StatusCode));
       end;
     except
       on E: Exception do
@@ -283,7 +308,7 @@ begin
     Memo1.Lines.Add('Текущая версия: ' + FClientVersion);
     Memo1.Lines.Add('Актуальная версия: ' + FServerVersion);
 
-    Result := FClientVersion <> FServerVersion;
+    Result := CompareText(FClientVersion, FServerVersion) <> 0;
     if Result then
       Memo1.Lines.Add('Доступно обновление!')
     else
@@ -308,7 +333,10 @@ begin
   HTTPClient := THTTPClient.Create;
   try
     try
+      HTTPClient.ConnectionTimeout := 5000;
+      HTTPClient.ResponseTimeout := 10000;
       Response := HTTPClient.Get(PATCH_LIST_URL + FClientVersion);
+
       if Response.StatusCode = 200 then
       begin
         JSONValue := TJSONObject.ParseJSONValue(Response.ContentAsString);
@@ -327,6 +355,10 @@ begin
         finally
           JSONValue.Free;
         end;
+      end
+      else
+      begin
+        Memo1.Lines.Add('Ошибка получения списка патчей: HTTP ' + IntToStr(Response.StatusCode));
       end;
     except
       on E: Exception do
@@ -418,12 +450,21 @@ begin
         OutputPath := IncludeTrailingPathDelimiter(FGamePath) + FileName;
 
         Memo1.Lines.Add('Обновление: ' + FileName);
-        CreateDirectoryForFile(OutputPath);
+        if not CreateDirectoryForFile(OutputPath) then
+        begin
+          Memo1.Lines.Add('Ошибка создания директории для: ' + FileName);
+          Continue;
+        end;
 
         if FileExists(OutputPath) then
           DeleteFile(OutputPath);
 
-        ZipFile.Extract(i, OutputPath, False);
+        try
+          ZipFile.Extract(i, OutputPath, False);
+        except
+          on E: Exception do
+            Memo1.Lines.Add('Ошибка распаковки файла ' + FileName + ': ' + E.Message);
+        end;
         Application.ProcessMessages;
       end;
 
@@ -593,11 +634,17 @@ function TForm1.CalculateFileHash(const FilePath: string): string;
 var
   FileStream: TFileStream;
 begin
-  FileStream := TFileStream.Create(FilePath, fmOpenRead or fmShareDenyWrite);
+  Result := '';
   try
-    Result := THashMD5.GetHashString(FileStream);
-  finally
-    FileStream.Free;
+    FileStream := TFileStream.Create(FilePath, fmOpenRead or fmShareDenyWrite);
+    try
+      Result := THashMD5.GetHashString(FileStream);
+    finally
+      FileStream.Free;
+    end;
+  except
+    on E: Exception do
+      Memo1.Lines.Add('Ошибка вычисления хэша файла ' + FilePath + ': ' + E.Message);
   end;
 end;
 
@@ -616,7 +663,10 @@ begin
   HTTPClient := THTTPClient.Create;
   try
     try
+      HTTPClient.ConnectionTimeout := 5000;
+      HTTPClient.ResponseTimeout := 10000;
       Response := HTTPClient.Get(SERVER_HASHES_URL);
+
       if Response.StatusCode = 200 then
       begin
         JSONValue := TJSONObject.ParseJSONValue(Response.ContentAsString);
@@ -812,26 +862,142 @@ begin
   end;
 end;
 
+function TForm1.IsProcessRunning(PID: DWORD): Boolean;
+var
+  hProcess: THandle;
+  ExitCode: DWORD;
+begin
+  Result := False;
+  hProcess := OpenProcess(PROCESS_QUERY_INFORMATION, False, PID);
+  if hProcess <> 0 then
+  try
+    if GetExitCodeProcess(hProcess, ExitCode) then
+      Result := (ExitCode = STILL_ACTIVE);
+  finally
+    CloseHandle(hProcess);
+  end;
+end;
+
+function TForm1.GetProcessName(hProcess: THandle): string;
+var
+  ModName: array[0..MAX_PATH] of Char;
+begin
+  if GetModuleFileNameEx(hProcess, 0, ModName, MAX_PATH) <> 0 then
+    Result := ModName
+  else
+    Result := 'Не удалось получить имя';
+end;
+
+//function TForm1.CheckDependencies: Boolean;
+//var
+//  Dependencies: array[0..2] of string; // Статический массив фиксированного размера
+//  I: Integer;
+//begin
+//  Result := True;
+//  Dependencies[0] := 'vcruntime140.dll';
+//  Dependencies[1] := 'd3dx9_43.dll';
+//  Dependencies[2] := 'xinput1_3.dll';
+
+//  for I := 0 to High(Dependencies) do
+//  begin
+//    if GetModuleHandle(PChar(Dependencies[I])) = 0 then
+//    begin
+//      Memo1.Lines.Add('Не найдена зависимость: ' + Dependencies[I]);
+//      Result := False;
+//    end;
+//  end;
+//end;
+
+function TForm1.RunAsAdmin(const ExePath, Params: string): Boolean;
+var
+  SEInfo: TShellExecuteInfo;
+begin
+  ZeroMemory(@SEInfo, SizeOf(SEInfo));
+  SEInfo.cbSize := SizeOf(SEInfo);
+  SEInfo.fMask := SEE_MASK_NOCLOSEPROCESS;
+  SEInfo.lpVerb := 'runas';
+  SEInfo.lpFile := PChar(ExePath);
+  SEInfo.lpParameters := PChar(Params);
+  SEInfo.nShow := SW_SHOWNORMAL;
+
+  Result := ShellExecuteEx(@SEInfo);
+  if Result then
+    WaitForSingleObject(SEInfo.hProcess, INFINITE);
+end;
+
 procedure TForm1.playButtonClick(Sender: TObject);
 var
   GameExe: string;
 begin
-  if FileExists(FGamePath + BIN64_PATH) then
-    GameExe := FGamePath + BIN64_PATH
-  else if FileExists(FGamePath + 'bin64\Aion.bin') then
-    GameExe := FGamePath + 'bin64\Aion.bin'
-  else if FileExists(FGamePath + BIN32_PATH) then
-    GameExe := FGamePath + BIN32_PATH
-  else if FileExists(FGamePath + 'bin32\Aion.bin') then
-    GameExe := FGamePath + 'bin32\Aion.bin'
-  else
+  GameExe := IncludeTrailingPathDelimiter(FGamePath) + 'bin64\aion.bin';
+
+  if not FileExists(GameExe) then
   begin
-    MessageDlg('Не найден исполняемый файл игры.', mtError, [mbOK], 0);
-    Exit;
+    GameExe := IncludeTrailingPathDelimiter(FGamePath) + 'bin32\aion.bin';
+    if not FileExists(GameExe) then
+    begin
+      MessageDlg('Файл игры не найден!', mtError, [mbOK], 0);
+      Exit;
+    end;
   end;
 
-  if ShellExecute(0, 'open', PChar(GameExe), nil, PChar(FGamePath), SW_SHOWNORMAL) <= 32 then
-    MessageDlg('Не удалось запустить игру.', mtError, [mbOK], 0);
+  // Проверка зависимостей
+  //if not CheckDependencies then
+  //begin
+  //  if MessageDlg('Не найдены необходимые DLL-библиотеки. Запустить игру все равно?',
+  //     mtWarning, [mbYes, mbNo], 0) = mrNo then
+  //    Exit;
+  //end;
+
+  // Попробуем сначала обычный запуск
+  if not TryNormalLaunch(GameExe) then
+  begin
+    // Если не получилось, пробуем с правами админа
+    Memo1.Lines.Add('Пробуем запуск с правами администратора...');
+    if not RunAsAdmin(GameExe, '-ip:127.0.0.1 -port:2106 -cc:1 -lang:enu -noweb -nowebshop -nokicks -noauthgg -charnamemenu -ingameshop -win10-mouse-fix-autodetect -disable-xigncode') then
+      MessageDlg('Не удалось запустить игру', mtError, [mbOK], 0);
+  end;
+end;
+
+function TForm1.TryNormalLaunch(const ExePath: string): Boolean;
+var
+  ProcessInfo: TProcessInformation;
+  StartupInfo: TStartupInfo;
+  ExitCode: DWORD;
+begin
+  ZeroMemory(@StartupInfo, SizeOf(StartupInfo));
+  StartupInfo.cb := SizeOf(StartupInfo);
+  StartupInfo.dwFlags := STARTF_USESHOWWINDOW;
+  StartupInfo.wShowWindow := SW_SHOWNORMAL;
+
+  Result := CreateProcess(
+    nil,
+    PChar('"' + ExePath + '" -ip:127.0.0.1 -port:2106 -lang:enu'),
+    nil,
+    nil,
+    False,
+    CREATE_NEW_CONSOLE,
+    nil,
+    PChar(ExtractFilePath(ExePath)),
+    StartupInfo,
+    ProcessInfo);
+
+  if Result then
+  begin
+    WaitForSingleObject(ProcessInfo.hProcess, 5000);
+    GetExitCodeProcess(ProcessInfo.hProcess, ExitCode);
+
+    // Коды ошибок Windows
+    case ExitCode of
+      STILL_ACTIVE: Memo1.Lines.Add('Игра запущена успешно');
+      3221225477: Memo1.Lines.Add('Ошибка: ACCESS_VIOLATION - проверьте зависимости');
+      3221225786: Memo1.Lines.Add('Ошибка: DLL_NOT_FOUND');
+      else Memo1.Lines.Add('Код выхода: ' + IntToStr(ExitCode));
+    end;
+
+    CloseHandle(ProcessInfo.hThread);
+    CloseHandle(ProcessInfo.hProcess);
+  end;
 end;
 
 procedure TForm1.stopButtonClick(Sender: TObject);
